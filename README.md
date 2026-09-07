@@ -1,113 +1,130 @@
-# Master Thesis Code
+# Long-Context Transformers with Axial Attention
 
-This repository contains two related projects used in the thesis:
+Code for my Master's thesis at TU Darmstadt on transformer models for long
+sequence forecasting. The core idea is to arrange the input sequence on a grid
+and apply attention along its axes separately, which reduces the attention cost
+from O(n²) to roughly O(n·√n) and makes much longer context windows tractable.
 
-- **Presence Prediction** (`tud_presence_prediction/`), a sequence model for customer presence forecasting, with training, evaluation, and plotting utilities.
-- **Weather Forecast** (`weather_prediction/`), a Long-Context Transformer pipeline for ERA5-based short-range weather prediction, including training, evaluation, and figure scripts.
+The repository contains two studies:
 
-The structure and commands below are based on the inspected source files in this archive.
+||Data|Reproducible|
+|-|-|-|
+|**`weather\_prediction/`** — short-range weather forecasting on ERA5|Public (Copernicus CDS)|**Yes**, end to end|
+|**`tud\_presence\_prediction/`** — customer presence forecasting|Internal TU Darmstadt data|No — code shown for reference only|
 
----
+If you want to run something, use **`weather\_prediction/`**. It is the
+self-contained study and the one the thesis results are built on.
 
-## Project Layout (evidence)
+\---
 
-- `tud_presence_prediction/homebrew_presence.py` — main CLI for training, prediction, evaluation, and plotting of the presence model.
-- `tud_presence_prediction/models/` — model definitions, including axial/FlashAttention variants (e.g. `LearnTransformer.py`, 'LearnTransformerAxialSelf.py') and utilities under `models/internal/`.
-- `tud_presence_prediction/plot_*` — plotting utilities for loss curves and evaluation figures (e.g., `plot_eval_results_fixed.py`, `plot_train.py`).
-- `tud_presence_prediction/download_era5_*` — helper scripts to fetch ERA5 data if needed (e.g., `download_era5_pressure_monthly.py`, `download_era5_single_monthly.py`).
+## 1\. Weather forecasting on ERA5 (reproducible)
 
-- `weather_prediction/homebrew_weather.py` — main CLI for training and evaluation on ERA5; supports context/prediction lengths and saving forecasts.
-- `weather_prediction/weather_transformer.py` and `weather_axialtransformer.py` — model definitions for the weather study.
-- `weather_prediction/plot_context_mse.py`, `plot_forecast_csv.py`, `plot_loss.py` — plotting and analysis scripts.
-- `weather_prediction/forecast_results/` and `train_results/` — default output folders for forecasts and training logs/checkpoints.
-- Example data files present (e.g., `era5_single_2021_01.netcdf`), useful to verify I/O.
+Short-range forecasting from ERA5 reanalysis fields. ERA5 is openly available
+from the Copernicus Climate Data Store, so every step below can be reproduced
+from scratch.
 
-These paths and filenames are taken directly from the codebase you provided.
+### Setup
 
----
-
-## Requirements
-
-Python packages inferred from imports across both projects are listed in `requirements.txt`. Key dependencies include:
-- **Core**: `torch`, `pytorch-lightning`, `torchmetrics`, `numpy`, `pandas`, `scikit-learn`, `tqdm`, `matplotlib`, `pillow`, `colorama`, `holidays`, `wandb`
-- **Weather/IO**: `netCDF4`, `cdsapi`
-- **Attention/Plotting**: `flash-attn` (for GPU-accelerated attention), `brokenaxes` (for figure formatting)
-
-> ⚠️ **FlashAttention**: Installing `flash-attn` requires a CUDA-capable GPU and a compatible PyTorch/CUDA toolchain. If you do not plan to use the FlashAttention variants, you can comment it out in `requirements.txt` and avoid those model files.
-
-Install with:
 ```bash
 pip install -r requirements.txt
 ```
 
----
+Key dependencies: `torch`, `pytorch-lightning`, `torchmetrics`, `numpy`,
+`pandas`, `matplotlib`, `netCDF4`, `cdsapi`, `wandb`.
 
-## Quickstart
+`flash-attn` is optional and needs a CUDA-capable GPU with a matching
+PyTorch/CUDA toolchain. Without it, use the non-FlashAttention model files —
+comment the dependency out in `requirements.txt`.
 
-### 1) Presence Prediction
+### Getting the data
 
-Train / evaluate / plot are handled by `tud_presence_prediction/homebrew_presence.py` (see its argparse flags in the file). Typical usage:
+ERA5 access is free but requires a Copernicus CDS account. Put your credentials
+in `\~/.cdsapirc`, then use the download helpers:
+
 ```bash
-# Train
-python tud_presence_prediction/homebrew_presence.py --train --model_file LearnTransformer --num_input_days 7 --num_days 1
-
-# Evaluate (examples only; see file for full set of flags)
-python tud_presence_prediction/homebrew_presence.py --evaluate --version <run_id_or_version>
-
-# Plot training curves
-python tud_presence_prediction/homebrew_presence.py --plot_loss --version <run_id_or_version>
+python download\_era5\_single\_monthly.py
+python download\_era5\_pressure\_monthly.py
 ```
 
-Relevant sources: `tud_presence_prediction/homebrew_presence.py`, models under `tud_presence_prediction/models/`, and plots `plot_train.py`, `plot_eval_results_fixed.py`.
+The pipeline expects single-level and pressure-level NetCDF files under
+`--data\_root` (default `\~/scratch/era5\_data/past`). A sample file
+(`era5\_single\_2021\_01.netcdf`) is included so you can verify the I/O path
+before downloading anything.
 
-### 2) Weather Forecast
+### Training and evaluation
 
-The main entry point is `weather_prediction/homebrew_weather.py`. Typical usage:
 ```bash
 # Train
-python weather_prediction/homebrew_weather.py --train \
-    --data_root ~/scratch/era5_data/past \    --batch_size 4 --context_days 7 --prediction_days 1 --hidden_dim 64
+python weather\_prediction/homebrew\_weather.py --train \\
+    --data\_root \~/scratch/era5\_data/past \\
+    --batch\_size 4 --context\_days 7 --prediction\_days 1 --hidden\_dim 64
 
-# Evaluate from a specific date (YYYY-MM-DD)
-python weather_prediction/homebrew_weather.py --evaluate_from_date 2024-03-15 \    --context_days 7 --prediction_days 1 --version <run_id_or_version>
+# Evaluate a trained run from a given start date
+python weather\_prediction/homebrew\_weather.py \\
+    --evaluate\_from\_date 2024-03-15 \\
+    --context\_days 7 --prediction\_days 1 --version <run\_id>
 ```
 
-To use the Long-Context / axial variants, see `weather_prediction/weather_transformer.py` and `weather_prediction/weather_axialtransformer.py`. Plots for context sweeps and forecast maps are in `plot_context_mse.py` and `plot_forecast_csv.py`.
+Model definitions: `weather\_transformer.py` (baseline) and
+`weather\_axialtransformer.py` (axial attention variant). Run
+`homebrew\_weather.py --help` for the full flag set.
 
----
+### Figures
 
-## Data
+```bash
+python weather\_prediction/plot\_loss.py           # training curves
+python weather\_prediction/plot\_context\_mse.py    # error vs. context length
+python weather\_prediction/plot\_forecast\_csv.py   # forecast maps
+```
 
-- **ERA5**: The weather pipeline expects ERA5 single-level and pressure-level data in NetCDF format. The default `--data_root` is `~/scratch/era5_data/past`. You can adjust via CLI.
-- Helper download scripts for ERA5 are provided (e.g., `tud_presence_prediction/download_era5_pressure_monthly.py`) and rely on `cdsapi`.
+Checkpoints and logs land in `train\_results/`, forecasts and metrics in
+`forecast\_results/`. Weights \& Biases logging activates if `WANDB\_API\_KEY` is
+set in the environment; otherwise disable it in the config.
 
----
+### Results
 
-## Logging & Checkpoints
+The axial attention variant more than doubles the usable context window. Under
+the same memory budget, the standard attention baseline saturates at **80 days**
+of context; the long-context model trains on **more than 160 days**.
 
-- Both projects use **PyTorch Lightning**. Checkpoints and logs are saved under `train_results/` and versioned subfolders.
-- **Weights & Biases** logging is enabled where configured (`wandb`). Set `WANDB_API_KEY` in your environment to activate, or disable in code if not needed.
+This was run as a proof of concept to probe where the limit moves, not as an
+accuracy benchmark — the result above is a capability gain, not an error
+reduction. Whether the longer context also improves forecast quality is a
+separate question; see `plot\_context\_mse.py` for the error-vs-context sweep.
 
----
+## 2\. Presence prediction (reference only, not runnable)
 
-## GPU/FlashAttention Notes
+A sequence model for forecasting customer presence, developed on an internal
+TU Darmstadt dataset. **The data is not public and is not part of this
+repository**, and neither are the trained checkpoints, logs or evaluation
+outputs derived from it. The code will not run without it, and there is no
+substitute dataset — please do not open issues asking for the data.
 
-- FlashAttention-based models import `flash_attn` (see `tud_presence_prediction/models/AxialDecoderOnly.py` and `weather_prediction/weather_transformer.py`).
-- Ensure your CUDA and PyTorch versions are compatible with the `flash-attn` wheel you install. Otherwise, prefer the non-FlashAttention model files.
+It is included because it is the second study of the thesis and because the
+axial attention implementation is shared between both. Read it, don't run it.
 
----
+* `homebrew\_presence.py` — CLI for training, prediction, evaluation and plotting
+* `models/` — model definitions, including the axial and FlashAttention variants
+(`LearnTransformer.py`, `LearnTransformerAxialSelf.py`, `AxialDecoderOnly.py`)
+and shared components under `models/internal/`
+* `plot\_train.py`, `plot\_eval\_results\_fixed.py` — figure scripts
 
-## Reproducibility
+The interesting part for a reader is `models/` — the attention implementation
+there is the same one used in the weather study, where you can actually execute
+it.
 
-- Scripts write evaluation CSV/JSON and figures under `forecast_results/`, `train_results/`, and the presence/evaluation folders.
-- Plotting utilities reside in `tud_presence_prediction/plot_*.py` and `weather_prediction/plot_*.py`. Re-run these to regenerate figures from saved logs.
-
----
+\---
 
 ## Troubleshooting
 
-- **ImportError: flash_attn**: Remove or comment the FlashAttention lines, or install a compatible `flash-attn` build.
-- **NetCDF errors**: Verify your ERA5 NetCDF files and paths. Example loaders are in `weather_prediction/data_load_test.py`.
-- **CDS API**: Configure your `~/.cdsapirc` before running the ERA5 download scripts.
+* **`ImportError: flash\_attn`** — install a `flash-attn` build matching your
+CUDA/PyTorch versions, or switch to the non-FlashAttention model files.
+* **NetCDF read errors** — check your ERA5 file paths and variable names;
+`weather\_prediction/data\_load\_test.py` is a minimal loader to test against.
+* **CDS API errors** — `\~/.cdsapirc` missing or malformed, or the CDS request
+queue is still processing your job.
 
----
+\---
+
+## 
+
