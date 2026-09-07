@@ -1,0 +1,49 @@
+\begin{longtable}{lrrrrrr}
+\caption{Per-channel comparison (Long-Context 2-day vs. finetuned 180-day). Two-decimal rounding. Positive $\Delta$MSE\% means finetuned performed worse.}
+\label{tab:app_lc_vs_ft_all}\\
+\toprule
+   Channel &   Sigma &     Uni &  MSE Regular &  MSE finetuned &  Delta MSE % &  Delta RMSE (non-percent) \\
+\midrule
+\endfirsthead
+\caption[]{Per-channel comparison (Long-Context 2-day vs. finetuned 180-day). Two-decimal rounding. Positive $\Delta$MSE\% means finetuned performed worse.} \\
+\toprule
+   Channel &   Sigma &     Uni &  MSE Regular &  MSE finetuned &  Delta MSE % &  Delta RMSE (non-percent) \\
+\midrule
+\endhead
+\midrule
+\multicolumn{7}{r}{{Continued on next page}} \\
+\midrule
+\endfoot
+
+\bottomrule
+\endlastfoot
+       d2m &    6.42 &       K &         0.04 &           0.05 &        32.28 &                      0.18 \\
+       msl & 1146.30 &      Pa &         0.00 &           0.00 &        25.07 &                      4.09 \\
+r\_1000hPa &   16.02 &       % &         0.56 &           0.52 &        -7.67 &                     -0.47 \\
+ r\_300hPa &   30.89 &       % &         1.01 &           0.99 &        -2.30 &                     -0.36 \\
+ r\_500hPa &   30.61 &       % &         0.99 &           1.14 &        15.26 &                      2.24 \\
+ r\_700hPa &   29.29 &       % &         0.91 &           1.13 &        24.59 &                      3.25 \\
+ r\_850hPa &   24.20 &       % &         0.82 &           1.05 &        28.34 &                      2.91 \\
+ r\_925hPa &   19.72 &       % &         0.67 &           0.76 &        13.39 &                      1.05 \\
+       t2m &    7.18 &       K &         0.03 &           0.04 &        25.29 &                      0.14 \\
+t\_1000hPa &    7.11 &       K &         0.02 &           0.03 &        60.02 &                      0.27 \\
+ t\_300hPa &    5.52 &       K &         0.00 &           0.00 &        35.44 &                      0.04 \\
+ t\_500hPa &    6.60 &       K &         0.37 &           0.60 &        60.25 &                      1.07 \\
+ t\_700hPa &    6.37 &       K &         0.19 &           0.32 &        74.28 &                      0.88 \\
+ t\_850hPa &    6.77 &       K &         0.06 &           0.11 &        87.90 &                      0.60 \\
+ t\_925hPa &    7.06 &       K &         0.04 &           0.06 &        74.54 &                      0.43 \\
+       u10 &    4.25 & m s**-1 &         0.76 &           0.93 &        22.27 &                      0.39 \\
+u\_1000hPa &    4.97 & m s**-1 &         0.74 &           1.00 &        34.47 &                      0.68 \\
+ u\_300hPa &   17.41 & m s**-1 &         0.72 &           0.92 &        27.57 &                      1.92 \\
+ u\_500hPa &   11.65 & m s**-1 &         0.73 &           0.93 &        27.51 &                      1.29 \\
+ u\_700hPa &    8.84 & m s**-1 &         0.73 &           0.92 &        26.24 &                      0.93 \\
+ u\_850hPa &    8.24 & m s**-1 &         0.72 &           0.87 &        20.20 &                      0.67 \\
+ u\_925hPa &    7.80 & m s**-1 &         0.71 &           0.87 &        22.57 &                      0.70 \\
+       v10 &    3.73 & m s**-1 &         0.94 &           1.19 &        27.45 &                      0.47 \\
+v\_1000hPa &    4.30 & m s**-1 &         0.90 &           1.17 &        29.01 &                      0.55 \\
+ v\_300hPa &   17.88 & m s**-1 &         0.74 &           0.97 &        30.53 &                      2.19 \\
+ v\_500hPa &   10.90 & m s**-1 &         0.74 &           0.96 &        29.58 &                      1.30 \\
+ v\_700hPa &    7.46 & m s**-1 &         0.80 &           0.98 &        22.74 &                      0.72 \\
+ v\_850hPa &    6.35 & m s**-1 &         0.92 &           1.07 &        15.90 &                      0.47 \\
+ v\_925hPa &    6.22 & m s**-1 &         0.98 &           1.19 &        21.18 &                      0.62 \\
+\end{longtable}

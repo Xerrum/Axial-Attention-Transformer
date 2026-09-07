@@ -1,0 +1,14 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\data",
+    "\\sample_data",
+    "\\tud_presence_prediction",
+    "\\tud_presence_prediction\\data",
+    "\\tud_presence_prediction\\models",
+    "\\tud_presence_prediction\\Vereidigung Visualisierung",
+    "\\weather_prediction"
+  ],
+  "SelectedNode": "\\tud_presence_prediction\\Vereidigung Visualisierung\\quadratic scaling.py",
+  "PreviewInSolutionExplorer": false
+}

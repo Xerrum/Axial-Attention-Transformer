@@ -1,0 +1,707 @@
+﻿# Project: ERA5 Weather Transformer with AFNO + (Flash)Attention
+# --------------------------------------------------------------
+# This single file contains a minimal but complete implementation to:
+# 1) Load ERA5 single-level and pressure-level NetCDF files from ~/scratch/era5_data
+# 2) Build tensors of shape [B, T, C, H, W]
+# 3) Apply per-time 2D convolution downsampling
+# 4) Apply a lightweight AFNO-style spectral mixing block (per time step)
+# 5) Add temporal positional encodings
+# 6) Run temporal Transformer self-attention either with standard PyTorch MultiheadAttention
+#    or FlashAttention (if installed and enabled)
+# 7) Train a simple one-step-ahead forecasting model in PyTorch Lightning
+#
+# Usage (examples):
+#   python era5_weather_transformer.py --data_root ~/scratch/era5_data --train --use_flash_attention True
+#   python era5_weather_transformer.py --data_root ~/scratch/era5_data --train --use_flash_attention False
+#
+# Notes:
+# - This file is organized into sections separated by "###" markers for clarity.
+# - It follows the style and flag names used in your presence-prediction code (e.g., use_flash_attention,
+#   hidden_dim, num_heads, num_of_layers, OneCycleLR), so it should feel familiar.
+# - The AFNO block here is a compact, dependency-free variant that captures the key idea:
+#   mixing in the Fourier domain on low-frequency modes, then inverse FFT with residual.
+# - Attention is purely temporal (across T) at each grid cell; spatial mixing happens via Conv + AFNO.
+# - No axial attention is used.
+
+### ---------------------------- Imports ----------------------------
+import os, glob, math, argparse, time
+from typing import List, Optional, Tuple
+
+import numpy as np
+# xarray is not used in the netCDF4 path, but kept as optional dependency
+# import xarray as xr
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+
+# Optional FlashAttention
+try:
+    from flash_attn.modules.mha import MHA as FlashMHA
+    _HAS_FLASH = True
+except Exception:
+    _HAS_FLASH = False
+
+### ------------------------- Data Utilities -------------------------
+# NetCDF4-based loader (exact variable names, matching your working snippet)
+import netCDF4 as nc
+from netCDF4 import num2date
+
+# Fixed, known variable names (no aliasing)
+SINGLE_VARS = ["t2m", "d2m", "u10", "v10", "msl", "tp"]
+PRESSURE_VARS = ["t", "r", "u", "v"]
+PRESSURE_LEVELS = [1000, 925, 850, 700, 500, 300]  # hPa
+
+
+def _read_time_from_var(ds: nc.Dataset, var_name: str) -> np.ndarray:
+    """Return time as numpy datetime64[h] using the first dimension of the given variable."""
+    v = ds.variables[var_name]
+    time_dim_name = v.dimensions[0]  # assume [time, lat, lon]
+    time_var = ds.variables[time_dim_name]
+    dts = num2date(time_var[:], time_var.units)
+    return np.array(dts, dtype="datetime64[h]")
+
+
+def _ensure_same_grid(lat_s, lon_s, lat_p, lon_p):
+    if lat_s.shape != lat_p.shape or lon_s.shape != lon_p.shape:
+        raise ValueError("Lat/Lon grids differ between single-level and pressure-level files.")
+    if not (np.allclose(lat_s, lat_p) and np.allclose(lon_s, lon_p)):
+        raise ValueError("Lat/Lon coordinates mismatch between datasets.")
+
+
+def load_single_level_nc(paths: list):
+    """Load single-level arrays with exact variable names.
+    Returns (times, lat, lon, transposed) with array shaped [744, 61, 61, 5] [T, H, W, C].
+    """
+    var_array = []
+    times_all = []
+    lat_ref = lon_ref = None
+
+    for fp in sorted(paths):
+        with nc.Dataset(fp) as ds:
+            # read reference time from t2m
+            t_arr = _read_time_from_var(ds, "t2m")
+            times_all.append(t_arr)
+
+            # get coordinates
+            lat = np.asarray(ds.variables["latitude"][:])
+            lon = np.asarray(ds.variables["longitude"][:])
+
+            # store reference coordinates from first file
+            if lat_ref is None:
+                lat_ref, lon_ref = lat, lon
+            
+            # collect all variables
+            for var_name in SINGLE_VARS:
+                data = ds.variables[var_name][:]
+                var_array.append(data)
+    
+    # Stack all variables along first dimension
+    stacked = np.stack(var_array, axis=0)  # shape: (n_vars, T, H, W)
+    transposed = np.transpose(stacked, (1, 2, 3, 0))  # shape: (744, 61, 61, 5)
+    # Rearrange to T, C, H, W format
+    times = np.concatenate(times_all, axis=0)
+    
+    return times, lat_ref, lon_ref, transposed
+
+
+def load_pressure_level_nc(paths: list):
+    """Load pressure-level arrays with exact variable names.
+    Returns (times, lat, lon, data_array) with array shaped [T, L, H, W, C].
+    where L is the number of pressure levels.
+    """
+    var_array = []
+    times_all = []
+    lat_ref = lon_ref = None
+
+    for fp in sorted(paths):
+        with nc.Dataset(fp) as ds:
+            # Get pressure levels
+            if "level" in ds.variables:
+                levels = np.asarray(ds.variables["level"][:])
+            else:
+                levels = np.asarray(ds.variables["isobaricInhPa"][:])
+            
+            # Convert to hPa if needed
+            levels_hpa = levels if levels.max() <= 1100 else levels / 100.0
+            
+            # Read time and coordinates
+            t_arr = _read_time_from_var(ds, "t")
+            times_all.append(t_arr)
+            
+            lat = np.asarray(ds.variables["latitude"][:])
+            lon = np.asarray(ds.variables["longitude"][:])
+            
+            if lat_ref is None:
+                lat_ref, lon_ref = lat, lon
+            
+            # Collect all variables for all pressure levels
+            for var_name in PRESSURE_VARS:
+                data = ds.variables[var_name][:]  # [T, L, H, W]
+                var_array.append(data)
+    
+    # Stack arrays along variable dimension
+    stacked = np.stack(var_array, axis=0)  # shape: (n_vars, T, L, H, W)
+    # Transpose to [T, L, H, W, C] format for better access
+    transposed = np.transpose(stacked, (1, 2, 3, 4, 0))
+    times = np.concatenate(times_all, axis=0)
+    
+    return times, lat_ref, lon_ref, transposed
+
+
+def build_stacked_tensor_single_plus_pressure(single_paths: list, pressure_paths: list) -> tuple:
+    """Build combined tensor from single-level and pressure-level data.
+    Returns (times, lat, lon, X) where X has shape [T, C, H, W].
+    """
+    # Load data from both file types
+    t_s, lat_s, lon_s, data_s = load_single_level_nc(single_paths)
+    t_p, lat_p, lon_p, data_p = load_pressure_level_nc(pressure_paths)
+    _ensure_same_grid(lat_s, lon_s, lat_p, lon_p)
+
+    # Find common timestamps between the datasets
+    common_t = np.intersect1d(t_s, t_p)
+    if len(common_t) == 0:
+        raise ValueError("No overlapping time stamps between datasets")
+    
+    # Get indices for the common timestamps
+    idx_s = np.nonzero(np.in1d(t_s, common_t))[0]
+    idx_p = np.nonzero(np.in1d(t_p, common_t))[0]
+    
+    # Stack data along channel dimension
+    # First add single-level variables
+    chans = [data_s[var_idx, idx_s] for var_idx, _ in enumerate(SINGLE_VARS)]
+    
+    # Then add pressure-level variables
+    for level_idx, _ in enumerate(PRESSURE_LEVELS):
+        for var_idx, _ in enumerate(PRESSURE_VARS):
+            chans.append(data_p[idx_p, level_idx, :, :, var_idx])
+    
+    # Stack along channel dimension
+    X = np.stack(chans, axis=1)  # [T, C, H, W]
+    
+    return common_t, lat_s, lon_s, X
+
+
+class ERA5SpatiotemporalDataset(Dataset):
+    """Dataset im von dir gewünschten Stil (große Blöcke + Teacher Forcing beim Training):
+
+    - Wir nehmen ein **Vergangenheits-Fenster** der Länge `context_len` und hängen daran
+      **`block_len` zukünftige Zeitpunkte** an. Pro Sample bekommen wir also eine **Sequenz**
+      `seq[t : t+context_len+block_len]` aller **gleichen Kanäle**.
+    - Das Modell wird im Trainer mit **Teacher Forcing** über die `block_len`-Schritte trainiert:
+      Aus den ersten `context_len` Frames wird Schritt für Schritt der nächste Frame vorhergesagt,
+      der **Ground Truth** wird jeweils als nächstes Eingabe-Frame angehängt.
+
+    Rückgabe pro Sample:
+      seq: float32 [T_seq, C, H, W] mit T_seq = context_len + block_len
+    """
+    def __init__(
+        self,
+        data_root: str,
+        context_len: int = 12,
+        block_len: int = 24,                         # *** NEU: Größe der Trainingsblöcke (Anzahl Vorhersageschritte) ***
+        downsample_to: Optional[Tuple[int, int]] = None,  # (H_ds, W_ds)
+        normalize: bool = True,
+        area_subset: Optional[Tuple[float, float, float, float]] = None,  # optionaler Geo-Ausschnitt
+    ):
+        super().__init__()
+        single_paths = sorted(glob.glob(os.path.join(os.path.expanduser(data_root), "single_level", "*.nc")))
+        pressure_paths = sorted(glob.glob(os.path.join(os.path.expanduser(data_root), "pressure_level", "*.nc")))
+        if len(single_paths) == 0 or len(pressure_paths) == 0:
+            raise FileNotFoundError("Expected NetCDF files under single_level/ and pressure_level/.")
+
+        times, lat, lon, X = build_stacked_tensor_single_plus_pressure(single_paths, pressure_paths)
+
+        # optional geographic subset (simple index-based subset)
+        if area_subset is not None:
+            lat_min, lat_max, lon_min, lon_max = area_subset
+            lat_idx = np.where((np.minimum(lat_min, lat_max) <= lat) & (lat <= np.maximum(lat_min, lat_max)))[0]
+            lon_idx = np.where((np.minimum(lon_min, lon_max) <= lon) & (lon <= np.maximum(lon_min, lon_max)))[0]
+            X = X[:, :, lat_idx[:, None], lon_idx]
+            self.lat = lat[lat_idx]
+            self.lon = lon[lon_idx]
+        else:
+            self.lat = lat
+            self.lon = lon
+
+        self.time = times
+        self.X = X.astype(np.float32)  # [T,C,H,W]
+        self.context_len = int(context_len)
+        self.block_len  = int(block_len)
+        self.normalize = normalize
+        self.downsample_to = downsample_to
+
+        if self.normalize:
+            mean = self.X.mean(axis=(0, 2, 3), keepdims=True)
+            std = self.X.std(axis=(0, 2, 3), keepdims=True) + 1e-6
+            self.X = (self.X - mean) / std
+
+        self.T_total, self.C, self.H, self.W = self.X.shape
+
+    def __len__(self):
+        # gültige Start-Indizes, so dass die gesamte Sequenz existiert:
+        # Ende-Index der Sequenz = i + context_len + block_len - 1  <=  T_total - 1
+        # => i_max = T_total - (context_len + block_len)
+        # Länge = i_max + 1 = T_total - (context_len + block_len) + 1
+        return max(0, int(self.T_total - (self.context_len + self.block_len) + 1))
+
+    def __getitem__(self, idx: int):
+        t0 = idx
+        t_end = idx + self.context_len + self.block_len  # exklusiv
+        seq_np = self.X[t0:t_end]                        # [T_seq,C,H,W]
+        if self.downsample_to is not None:
+            H_ds, W_ds = self.downsample_to
+            seq_t = torch.from_numpy(seq_np).float()      # [T_seq,C,H,W]
+            seq_t = F.interpolate(seq_t, size=(H_ds, W_ds), mode="bilinear", align_corners=False)
+            return seq_t
+        return torch.from_numpy(seq_np).float()
+
+### ------------------------- Model Components -------------------------
+class ConvDownsampler(nn.Module):
+    """Per-time 2D Conv downsampling with residual 1x1 path. Operates on [B, T, C, H, W]."""
+    def __init__(self, C_in: int, C_out: int, stride: int = 2, kernel_size: int = 3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(C_in, C_out, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.proj = nn.Conv2d(C_in, C_out, kernel_size=1, stride=stride)
+        self.norm = nn.BatchNorm2d(C_out)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+        x2d = x.reshape(B*T, C, H, W)
+        y = self.conv(x2d) + self.proj(x2d)
+        y = self.norm(y)
+        y = self.act(y)
+        C_out, H2, W2 = y.shape[1], y.shape[2], y.shape[3]
+        return y.reshape(B, T, C_out, H2, W2)
+
+
+class AFNO2DMinimal(nn.Module):
+    """A compact AFNO-style spectral mixing block for 2D fields.
+    - FFT2 over H,W
+    - Multiply low-frequency band with learnable complex weights (per channel)
+    - iFFT2 and residual + norm
+    Operates on [B, T, C, H, W] (applies per time step).
+    """
+    def __init__(self, C: int, H: int, W: int, keep_ratio: float = 0.25, dropout: float = 0.0):
+        super().__init__()
+        self.C = C
+        self.keep_h = max(1, int(H * keep_ratio))
+        self.keep_w = max(1, int(W * keep_ratio))
+        # Learnable complex weights for low-frequency rectangle
+        self.weight_real = nn.Parameter(torch.randn(C, self.keep_h, self.keep_w) * 0.02)
+        self.weight_imag = nn.Parameter(torch.randn(C, self.keep_h, self.keep_w) * 0.02)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.GroupNorm(num_groups=min(8, C), num_channels=C)
+        self.act = nn.GELU()
+
+    def _mix_freq(self, x_fft: torch.Tensor) -> torch.Tensor:
+        # x_fft: complex64/complex32 [B*T, C, H, W//2+1] (from rfft2)
+        BxT, C, Hf, Wf = x_fft.shape
+        kh = min(self.keep_h, Hf)
+        kw = min(self.keep_w, Wf)
+        low = x_fft[:, :, :kh, :kw]
+        # Apply complex multiplication with learnable weights (per-channel, freq-wise)
+        wr = self.weight_real[:, :kh, :kw]
+        wi = self.weight_imag[:, :kh, :kw]
+        # Broadcast to [B*T, C, kh, kw]
+        wr = wr.unsqueeze(0).expand(BxT, -1, -1, -1)
+        wi = wi.unsqueeze(0).expand(BxT, -1, -1, -1)
+        # Complex multiply: (a+ib)*(wr+i*wi) = (a*wr - b*wi) + i(a*wi + b*wr)
+        a = low.real
+        b = low.imag
+        real = a * wr - b * wi
+        imag = a * wi + b * wr
+        mixed = torch.complex(real, imag)
+        x_fft = x_fft.clone()
+        x_fft[:, :, :kh, :kw] = mixed
+        return x_fft
+
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+        x2d = x.reshape(B*T, C, H, W)
+        x_fft = torch.fft.rfft2(x2d, norm='ortho')  # [B*T, C, H, W//2+1]
+        x_fft = self._mix_freq(x_fft)
+        y = torch.fft.irfft2(x_fft, s=(H, W), norm='ortho')
+        y = self.dropout(y)
+        y = self.norm(y)
+        y = self.act(y)
+        y = y + x2d  # residual
+        return y.reshape(B, T, C, H, W)
+
+
+class TimePositionalEncoding(nn.Module):
+    """Standard sinusoidal positional encoding over time T applied to tokens.
+    Input/Output shape for tokens: [Nseq, T, D]
+    """
+    def __init__(self, d_model: int, max_len: int = 4096):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)  # [max_len, D]
+
+    def forward(self, x):
+        # x: [N, T, D]
+        T = x.size(1)
+        return x + self.pe[:T].unsqueeze(0)
+
+
+class TemporalTransformerBlock(nn.Module):
+    """Temporal self-attention at each grid cell independently.
+    Input comes as tokens [N, T, D].
+    If FlashAttention is enabled and available, uses FlashMHA; otherwise MultiheadAttention.
+    """
+    def __init__(self, d_model: int, num_heads: int, dropout: float, use_flash_attention: bool):
+        super().__init__()
+        self.use_flash = bool(use_flash_attention and _HAS_FLASH)
+        if self.use_flash:
+            self.mha = FlashMHA(d_model, num_heads=num_heads, dropout=dropout, causal=False, cross_attn=False)
+        else:
+            self.mha = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, 4*d_model), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(4*d_model, d_model), nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        if self.use_flash:
+            x = self.norm1(x + self.mha(x))
+        else:
+            attn_out, _ = self.mha(x, x, x)
+            x = self.norm1(x + attn_out)
+        x = self.norm2(x + self.ff(x))
+        return x
+
+
+class WeatherTransformer(nn.Module):
+    """Full model: Conv↓ (per time) -> AFNO (per time) -> Temporal Transformer -> head.
+    - Expects input X: [B, T, C, H, W]
+    - Predicts next-step field Yhat: [B, C, H, W]
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+        stride: int = 2,   # spatial downsampling factor in ConvDownsampler
+        use_flash_attention: bool = True,
+    ):
+        super().__init__()
+        self.use_flash_attention = use_flash_attention and _HAS_FLASH
+        self.stride = stride
+
+        # 1) Per-time Conv downsample + channel lift to hidden_dim
+        self.down = ConvDownsampler(C_in=in_channels, C_out=hidden_dim, stride=stride, kernel_size=3)
+
+        # 2) AFNO in hidden space (per time)
+        # We'll instantiate at forward-time when H,W are known (lazy), to keep code flexible
+        self.afno: Optional[AFNO2DMinimal] = None
+
+        # 3) Temporal Transformer blocks (operate on [N= B*H'*W', T, D])
+        self.posenc = TimePositionalEncoding(d_model=hidden_dim)
+        self.blocks = nn.ModuleList([
+            TemporalTransformerBlock(d_model=hidden_dim, num_heads=num_heads, dropout=dropout,
+                                     use_flash_attention=self.use_flash_attention)
+            for _ in range(num_layers)
+        ])
+
+        # 4) Output head: predict next-step in original channel count at original resolution
+        self.head = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        # x: [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+        y = self.down(x)  # [B, T, D, H', W']
+        _, _, D, H2, W2 = y.shape
+
+        # Lazy AFNO init if needed
+        if self.afno is None:
+            self.afno = AFNO2DMinimal(C=D, H=H2, W=W2, keep_ratio=0.25, dropout=0.0).to(y.device)
+
+        y = self.afno(y)  # [B, T, D, H', W']
+
+        # Rearrange to tokens per grid cell for temporal attention
+        y = y.permute(0, 3, 4, 1, 2).contiguous()  # [B, H', W', T, D]
+        N = B * H2 * W2
+        y = y.view(N, T, D)                        # [N, T, D]
+
+        # Add temporal positional encoding
+        y = self.posenc(y)
+
+        # Transformer over time
+        for blk in self.blocks:
+            y = blk(y)  # [N, T, D]
+
+        # Take the last time token as representation to predict next step
+        y_last = y[:, -1, :]          # [N, D]
+        y_last = y_last.view(B, H2, W2, D).permute(0, 3, 1, 2).contiguous()  # [B, D, H', W']
+
+        # Project to channels and upsample back to original resolution
+        yhat_low = self.head(y_last)  # [B, C, H', W']
+        if self.stride > 1:
+            yhat = F.interpolate(yhat_low, size=(H, W), mode="bilinear", align_corners=False)
+        else:
+            yhat = yhat_low
+        return yhat
+
+
+### ------------------------- Lightning Module -------------------------
+class WeatherLightning(pl.LightningModule):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int = 64,
+        num_heads: int = 4,
+        num_of_layers: int = 4,
+        dropout: float = 0.1,
+        fixed_learning_rate: float = 3e-4,
+        weight_decay: float = 1e-2,
+        use_LR_scheduler: bool = True,
+        use_flash_attention: bool = True,
+        stride: int = 2,
+        context_len: int = 12,
+        block_len: int = 24,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.model = WeatherTransformer(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_of_layers,
+            dropout=dropout,
+            stride=stride,
+            use_flash_attention=use_flash_attention,
+        )
+        self.loss = nn.MSELoss()
+
+    def forward(self, x):
+        return self.model(x)
+
+    def configure_optimizers(self):
+        opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.fixed_learning_rate, weight_decay=self.hparams.weight_decay)
+        if not self.hparams.use_LR_scheduler:
+            return opt
+        ts = int(getattr(self.trainer, "estimated_stepping_batches", 0))
+        if ts < 2:
+            return opt
+        warmup_steps = max(1, int(math.ceil(ts * 0.1)))
+        if warmup_steps >= ts:
+            warmup_steps = ts - 1
+        pct_start = warmup_steps / ts
+        sch = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=self.hparams.fixed_learning_rate, total_steps=ts,
+            pct_start=pct_start, div_factor=25, final_div_factor=1000
+        )
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step"}}
+
+    def _teacher_forcing_loss(self, seq: torch.Tensor) -> torch.Tensor:
+        """Teacher Forcing über einen Block: seq = [B, T_seq, C, H, W].
+        Wir verwenden die ersten context_len Frames als Startzustand und
+        berechnen die Loss über alle block_len Vorhersageschritte, wobei
+        jeweils die **Ground Truth** wieder angefügt wird.
+        """
+        B, T_seq, C, H, W = seq.shape
+        ctx = self.hparams.context_len
+        K   = T_seq - ctx                     # Anzahl der Vorhersageschritte im Block
+        state = seq[:, :ctx]                  # [B, ctx, C, H, W]
+        losses = []
+        for s in range(K):
+            yhat = self(state)                # [B, C, H, W]
+            target = seq[:, ctx + s]          # [B, C, H, W]
+            losses.append(self.loss(yhat, target))
+            # Teacher Forcing: Ground Truth anhängen
+            state = torch.cat([state[:, 1:], target.unsqueeze(1)], dim=1)
+        return torch.stack(losses).mean()
+
+    def _autoregressive_rollout_loss(self, seq: torch.Tensor) -> torch.Tensor:
+        """Autoregressive (ohne Teacher Forcing) über den Block für Val/Test.
+        Start mit context_len Frames, danach wird das **eigene** yhat zurückgeführt.
+        """
+        B, T_seq, C, H, W = seq.shape
+        ctx = self.hparams.context_len
+        K   = T_seq - ctx
+        state = seq[:, :ctx]
+        preds = []
+        for s in range(K):
+            yhat = self(state)
+            preds.append(yhat)
+            state = torch.cat([state[:, 1:], yhat.detach().unsqueeze(1)], dim=1)
+        preds = torch.stack(preds, dim=1)     # [B, K, C, H, W]
+        targets = seq[:, ctx:ctx+K]
+        return self.loss(preds, targets)
+
+    def training_step(self, batch, batch_idx):
+        # batch: [B, T_seq, C, H, W]
+        seq = batch
+        loss = self._teacher_forcing_loss(seq)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        seq = batch
+        with torch.no_grad():
+            loss = self._autoregressive_rollout_loss(seq)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        seq = batch
+        with torch.no_grad():
+            loss = self._autoregressive_rollout_loss(seq)
+        self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+
+### ----------------------------- Training -----------------------------
+
+def build_dataloaders(
+    data_root: str,
+    batch_size: int = 1,
+    context_len: int = 12,
+    block_len: int = 24,
+    downsample_to: Optional[Tuple[int, int]] = None,
+    num_workers: int = 4,
+    holdout_days: int = 14,      # letzte 14 Tage als Test
+    val_fraction: float = 0.05,  # kleiner Teil des (vor-Test) Bereichs für Validation
+):
+    ds = ERA5SpatiotemporalDataset(
+        data_root=data_root,
+        context_len=context_len,
+        block_len=block_len,
+        downsample_to=downsample_to,
+        normalize=True,
+        area_subset=None,
+    )
+
+    N = len(ds)
+    times = ds.time                  # Länge = T_total
+    ctx = ds.context_len
+    K   = ds.block_len
+
+    # Für jedes Sample i endet der Block beim Index:
+    # end_idx = i + ctx + K - 1 (letztes Target des Blocks)
+    idx_all = np.arange(N)
+    end_idx = idx_all + (ctx + K - 1)
+    end_times = times[end_idx]
+
+    # Test-Start: letzte N Tage vom **Ende** der Serie (inklusive)
+    cutoff_test = times[-1] - np.timedelta64(int(holdout_days), 'D')
+
+    # Alles mit end_time > cutoff_test → Test (liegt innerhalb der letzten N Tage)
+    test_mask = end_times > cutoff_test
+    trainval_mask = ~test_mask
+
+    idx_trainval = idx_all[trainval_mask]
+    # Chronologisches Sortieren nach end_times
+    order = np.argsort(end_times[trainval_mask])
+    idx_trainval = idx_trainval[order]
+
+    # Validation = letzter val_fraction-Anteil aus Train/Val-Bereich
+    n_trainval = len(idx_trainval)
+    n_val = max(1, int(round(val_fraction * n_trainval)))
+    n_train = max(1, n_trainval - n_val)
+
+    train_idx = idx_trainval[:n_train]
+    val_idx   = idx_trainval[n_train:]
+    test_idx  = idx_all[test_mask]
+
+    def collate(batch):
+        # batch ist Liste von Tensoren [T_seq,C,H,W] → stacke zu [B,T_seq,C,H,W]
+        return torch.stack(batch, dim=0)
+
+    train_loader = DataLoader(torch.utils.data.Subset(ds, train_idx), batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True, collate_fn=collate)
+    val_loader   = DataLoader(torch.utils.data.Subset(ds, val_idx), batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=True, collate_fn=collate)
+    test_loader  = DataLoader(torch.utils.data.Subset(ds, test_idx), batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=True, collate_fn=collate)
+
+    in_channels = ds.C
+    spatial = (ds.H if downsample_to is None else downsample_to[0], ds.W if downsample_to is None else downsample_to[1])
+    return train_loader, val_loader, test_loader, in_channels, spatial
+
+def main():
+    parser = argparse.ArgumentParser(description="ERA5 Weather Transformer (Conv + AFNO + (Flash)Attention)")
+    parser.add_argument('--data_root', type=str, required=True, help='Path to ~/scratch/era5_data')
+    parser.add_argument('--train', action='store_true', help='Run training')
+    parser.add_argument('--run_test', action='store_true', help='Evaluate on the test split (last N days)')
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--context_len', type=int, default=12, help='Number of input time steps')
+    parser.add_argument('--block_len', type=int, default=24, help='Number of prediction steps per training block')
+    parser.add_argument('--downsample', type=int, default=4, help='Spatial downsample factor (Conv stride)')
+    parser.add_argument('--hidden_dim', type=int, default=64)
+    parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-2)
+    parser.add_argument('--use_flash_attention', type=lambda x: x.lower()=="true", default=True)
+    parser.add_argument('--max_epochs', type=int, default=10)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--holdout_days', type=int, default=14)
+    parser.add_argument('--val_fraction', type=float, default=0.05)
+
+    args = parser.parse_args()
+
+    # Dataloaders mit: Train/Val = alles bis auf letzte N Tage; Test = letzte N Tage
+    train_loader, val_loader, test_loader, in_channels, spatial = build_dataloaders(
+        data_root=args.data_root,
+        batch_size=args.batch_size,
+        context_len=args.context_len,
+        block_len=args.block_len,
+        downsample_to=None,  # Downsampling im Modell via stride
+        num_workers=args.num_workers,
+        holdout_days=args.holdout_days,
+        val_fraction=args.val_fraction,
+    )
+
+    # Lightning-Modul mit Teacher Forcing im Training und Autoregressiv in Val/Test
+    lit = WeatherLightning(
+        in_channels=in_channels,
+        hidden_dim=args.hidden_dim,
+        num_heads=args.num_heads,
+        num_of_layers=args.num_layers,
+        dropout=args.dropout,
+        fixed_learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        use_LR_scheduler=True,
+        use_flash_attention=args.use_flash_attention,
+        stride=args.downsample,
+        context_len=args.context_len,
+        block_len=args.block_len,
+    )
+
+    ckpt = ModelCheckpoint(filename="{epoch:04d}-{val_loss:.3f}", monitor='val_loss', mode='min', save_top_k=1)
+    early = EarlyStopping(monitor='val_loss', patience=5, mode='min', verbose=True)
+
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        callbacks=[ckpt, early],
+        accelerator='auto', devices='auto',
+        precision='bf16-mixed',
+        log_every_n_steps=10,
+    )
+
+    if args.train:
+        trainer.fit(lit, train_loader, val_loader)
+        print(f"[INFO] Best checkpoint: {ckpt.best_model_path}")
+
+    if args.run_test:
+        test_metrics = trainer.test(lit, dataloaders=test_loader)
+        print(f"[INFO] Test metrics: {test_metrics}")
+
+if __name__ == '__main__':
+    main()

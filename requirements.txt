@@ -1,0 +1,16 @@
+torch
+pytorch-lightning
+torchmetrics
+flash-attn
+numpy
+pandas
+matplotlib
+scikit-learn
+tqdm
+wandb
+holidays
+colorama
+pillow
+brokenaxes
+netCDF4
+cdsapi
